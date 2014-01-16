@@ -1,5 +1,6 @@
-// Package goapenuts provides a connection to the Apple Push Notification service according to the docs at
-// https://developer.apple.com/library/ios/documentation/NetworkingInternet/Conceptual/RemoteNotificationsPG/Chapters/CommunicatingWIthAPS.html
+// Package goapenuts simplifies use of the Apple Push Notification service.
+// 
+// For protocol details, see the docs available at https://developer.apple.com/library/ios/documentation/NetworkingInternet/Conceptual/RemoteNotificationsPG/Chapters/CommunicatingWIthAPS.html
 package goapenuts
 
 import (
@@ -301,7 +302,7 @@ func (c *Connection) Connected() bool {
 //
 // Note: an unbuffered channel is used, so if you intend to track errors
 // you should start listening before calling c.Connect()
-func (c *Connection) Error() chan error {
+func (c *Connection) Error() <-chan error {
 	return c.error
 }
 
