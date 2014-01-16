@@ -1,4 +1,4 @@
-# Go (golang) support for sending notifications through the Apple Push Notification service
+## Go (golang) support for the Apple Push Notification service
 
 Package goapenuts simplifies use of the Apple Push Notification service.
 
