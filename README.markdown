@@ -7,9 +7,7 @@ https://developer.apple.com/library/ios/documentation/NetworkingInternet/Concept
 
 ### Install
 
-Install with:
-
-  go get github.com/JeremyOT/goapenuts
+    go get github.com/JeremyOT/goapenuts
 
 ### Example
 
