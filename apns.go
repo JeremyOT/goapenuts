@@ -219,7 +219,7 @@ func (c *Connection) runPush() {
 				binary.Read(data, binary.BigEndian, &command)
 				binary.Read(data, binary.BigEndian, &status)
 				binary.Read(data, binary.BigEndian, &id)
-				c.sendError(errors.New(fmt.Sprintf("APNS Error %d: %s\n", status, ErrorMessages[status])))
+				c.sendError(errors.New(fmt.Sprintf("APNS Error %d: %s", status, ErrorMessages[status])))
 				// Resend all payloads since the last successful push
 				resendBuffer := c.copyPayloadBuffer(id, resendErrorCodes[status])
 				c.sendError(c.connect())
