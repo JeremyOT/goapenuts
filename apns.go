@@ -1,5 +1,5 @@
 // Package goapenuts simplifies use of the Apple Push Notification service.
-// 
+//
 // For protocol details, see the docs available at https://developer.apple.com/library/ios/documentation/NetworkingInternet/Conceptual/RemoteNotificationsPG/Chapters/CommunicatingWIthAPS.html
 package goapenuts
 
@@ -12,6 +12,13 @@ import (
 	"io"
 	"net"
 	"time"
+)
+
+const (
+	GatewayAddress         = "gateway.push.apple.com:2195"
+	SandboxGatewayAddress  = "gateway.sandbox.push.apple.com:2195"
+	FeedbackAddress        = "feedback.push.apple.com:2196"
+	SandboxFeedbackAddress = "feedback.sandbox.push.apple.com:2196"
 )
 
 // The APNS payload. Token should be a valid 32 byte device token. Payload is a json encoded
@@ -41,31 +48,42 @@ type Feedback struct {
 	Token [32]byte
 }
 
+type StatusCode uint8
+
+const (
+	NoError            StatusCode = 0
+	ProcessingError    StatusCode = 1
+	MissingDeviceToken StatusCode = 2
+	MissingTopic       StatusCode = 3
+	MissingPayload     StatusCode = 4
+	InvalidTokenSize   StatusCode = 5
+	InvalidTopicSize   StatusCode = 6
+	InvalidPayloadSize StatusCode = 7
+	InvalidToken       StatusCode = 8
+	Shutdown           StatusCode = 10
+	UnknownError       StatusCode = 255
+)
+
 // Apple defined error codes
-var ErrorMessages = map[uint8]string{
-	0:   "No errors encountered",
-	1:   "Processing error",
-	2:   "Missing device token",
-	3:   "Missing topic",
-	4:   "Missing payload",
-	5:   "Invalid token size",
-	6:   "Invalid topic size",
-	7:   "Invalid payload size",
-	8:   "Invalid token",
-	10:  "Shutdown",
-	255: "None (unknown)",
+var ErrorMessages = map[StatusCode]string{
+	NoError:            "No errors encountered",
+	ProcessingError:    "Processing error",
+	MissingDeviceToken: "Missing device token",
+	MissingTopic:       "Missing topic",
+	MissingPayload:     "Missing payload",
+	InvalidTokenSize:   "Invalid token size",
+	InvalidTopicSize:   "Invalid topic size",
+	InvalidPayloadSize: "Invalid payload size",
+	InvalidToken:       "Invalid token",
+	Shutdown:           "Shutdown",
+	UnknownError:       "None (unknown)",
 }
 
 // Resend the message that triggered the error
-var resendErrorCodes = map[uint8]bool{
-	0:  true,
-	10: true,
+var resendStatusCodes = map[StatusCode]bool{
+	NoError:  true,
+	Shutdown: true,
 }
-
-const GatewayAddress = "gateway.push.apple.com:2195"
-const SandboxGatewayAddress = "gateway.sandbox.push.apple.com:2195"
-const FeedbackAddress = "feedback.push.apple.com:2196"
-const SandboxFeedbackAddress = "feedback.sandbox.push.apple.com:2196"
 
 func frame(payload *Payload) []byte {
 	frameBuffer := bytes.NewBuffer([]byte{})
@@ -112,8 +130,10 @@ type Connection struct {
 	push            chan *Payload
 	stop            chan bool
 	error           chan error
+	badToken        chan []byte
 	payloadBuffer   []*Payload
 	lastPayloadId   uint32
+	keepAlivePeriod time.Duration
 }
 
 // A convenience method to create a new Payload that expires immediately and has
@@ -148,8 +168,15 @@ func NewConnection(cert tls.Certificate, sandbox bool, bufferSize uint32) *Conne
 		config:          &tls.Config{Certificates: []tls.Certificate{cert}},
 		push:            make(chan *Payload),
 		error:           make(chan error),
+		badToken:        make(chan []byte),
 		payloadBuffer:   make([]*Payload, bufferSize),
 	}
+}
+
+// If greater than zero, keepalive messages will be sent on the connection with the given frequency.
+// Must be called before Connect().
+func (c *Connection) SetKeepAlivePeriod(keepAlivePeriod time.Duration) {
+	c.keepAlivePeriod = keepAlivePeriod
 }
 
 func (c *Connection) nextPayloadId(i uint32) (n uint32) {
@@ -160,7 +187,7 @@ func (c *Connection) nextPayloadId(i uint32) (n uint32) {
 	return
 }
 
-func (c *Connection) copyPayloadBuffer(startId uint32, includeStart bool) (buffer []*Payload) {
+func (c *Connection) copyPayloadBuffer(startId uint32, includeStart bool) (buffer []*Payload, rejectedPayload *Payload) {
 	if startId >= uint32(len(c.payloadBuffer)) {
 		buffer = []*Payload{}
 		return
@@ -174,6 +201,7 @@ func (c *Connection) copyPayloadBuffer(startId uint32, includeStart bool) (buffe
 	if includeStart {
 		outsize += 1
 	} else {
+		rejectedPayload = c.payloadBuffer[startId]
 		startId += 1
 	}
 	buffer = make([]*Payload, outsize)
@@ -197,6 +225,25 @@ func (c *Connection) sendError(err error) {
 	}
 }
 
+func (c *Connection) sendBadToken(token []byte) {
+	select {
+	case c.badToken <- token:
+	default:
+		// Bad tokens are not being tracked, move on
+	}
+}
+
+func (c *Connection) reconnect() (err error) {
+	err = c.connect()
+	c.sendError(err)
+	if err != nil {
+		c.Close()
+		return
+	}
+	go c.runPush()
+	return
+}
+
 func (c *Connection) runPush() {
 	defer c.conn.Close()
 	response := [6]byte{}
@@ -208,12 +255,17 @@ func (c *Connection) runPush() {
 			payload.id = c.nextPayloadId(c.lastPayloadId)
 			c.payloadBuffer[payload.id] = payload
 			c.lastPayloadId = payload.id
-			c.conn.Write(frame(payload))
+			if _, err := c.conn.Write(frame(payload)); err != nil {
+				c.sendError(err)
+				c.reconnect()
+				return
+			}
 		default:
 			c.conn.SetReadDeadline(time.Now().Add(250 * time.Millisecond))
 			n, err := c.conn.Read(response[:])
 			if n > 0 {
-				var command, status uint8
+				var command uint8
+				var status StatusCode
 				var id uint32
 				data := bytes.NewBuffer(response[:])
 				binary.Read(data, binary.BigEndian, &command)
@@ -221,9 +273,11 @@ func (c *Connection) runPush() {
 				binary.Read(data, binary.BigEndian, &id)
 				c.sendError(errors.New(fmt.Sprintf("APNS Error %d: %s", status, ErrorMessages[status])))
 				// Resend all payloads since the last successful push
-				resendBuffer := c.copyPayloadBuffer(id, resendErrorCodes[status])
-				c.sendError(c.connect())
-				go c.runPush()
+				resendBuffer, rejectedPayload := c.copyPayloadBuffer(id, resendStatusCodes[status])
+				if status == InvalidToken {
+					c.sendBadToken(rejectedPayload.Token)
+				}
+				c.reconnect()
 				for _, payload := range resendBuffer {
 					if payload == nil {
 						// This may happen if the APNS returns an invalid ID
@@ -241,9 +295,8 @@ func (c *Connection) runPush() {
 					}
 				default:
 				}
-
-				c.sendError(c.connect())
-				go c.runPush()
+				c.sendError(err)
+				c.reconnect()
 				return
 			}
 		}
@@ -257,6 +310,14 @@ func (c *Connection) connect() (err error) {
 	conn, err := net.Dial("tcp", c.pushAddress)
 	if err != nil {
 		return
+	}
+	if c.keepAlivePeriod > 0 {
+		if err = conn.(*net.TCPConn).SetKeepAlive(true); err != nil {
+			return
+		}
+		if err = conn.(*net.TCPConn).SetKeepAlivePeriod(c.keepAlivePeriod); err != nil {
+			return
+		}
 	}
 	c.conn = tls.Client(conn, c.config)
 	err = c.conn.Handshake()
@@ -306,10 +367,24 @@ func (c *Connection) Error() <-chan error {
 	return c.error
 }
 
-// Check the APNS Feedback Service for invalid device tokens.
+// Returns a channel that can be used to monitor bad token responses from the APNS.
+// Tokens sent to this channel should not be used again. Under normal operation
+// invalid tokens will be returned by the CheckFeedback(), if tokens are sent
+// through this channel they were likely send to the wrong service (e.g. sandbox sent
+// to production).
+//
+// Note: an unbuffered channel is used, so if you intend to track bad tokens
+// you should start listening before calling c.Connect()
+func (c *Connection) BadToken() <-chan []byte {
+	return c.badToken
+}
+
+// Check the APNS Feedback Service for invalid device tokens. These tokens represent
+// uninstalled applications and should not be used again.
 func (c *Connection) CheckFeedback() (feedback []*Feedback, err error) {
 	feedback = make([]*Feedback, 0, 100)
 	var conn net.Conn
+	var read int
 	if conn, err = net.Dial("tcp", c.feedbackAddress); err != nil {
 		return
 	}
@@ -320,7 +395,8 @@ func (c *Connection) CheckFeedback() (feedback []*Feedback, err error) {
 	}
 	response := [38]byte{}
 	for {
-		if _, err = feedbackConn.Read(response[:]); err != nil {
+		feedbackConn.SetReadDeadline(time.Now().Add(5 * time.Second))
+		if read, err = feedbackConn.Read(response[:]); err != nil {
 			switch err.(type) {
 			case net.Error:
 				if err.(net.Error).Timeout() {
@@ -331,6 +407,8 @@ func (c *Connection) CheckFeedback() (feedback []*Feedback, err error) {
 					err = nil
 				}
 			}
+			return
+		} else if read == 0 {
 			return
 		}
 		f := &Feedback{Token: [32]byte{}}
