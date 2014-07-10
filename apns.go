@@ -15,10 +15,23 @@ import (
 )
 
 const (
-	GatewayAddress         = "gateway.push.apple.com:2195"
-	SandboxGatewayAddress  = "gateway.sandbox.push.apple.com:2195"
-	FeedbackAddress        = "feedback.push.apple.com:2196"
-	SandboxFeedbackAddress = "feedback.sandbox.push.apple.com:2196"
+	GatewayAddress                    = "gateway.push.apple.com"
+	SandboxGatewayAddress             = "gateway.sandbox.push.apple.com"
+	FeedbackAddress                   = "feedback.push.apple.com"
+	SandboxFeedbackAddress            = "feedback.sandbox.push.apple.com"
+	GatewayPort                       = 2195
+	FeedbackPort                      = 2196
+	NoError                StatusCode = 0
+	ProcessingError        StatusCode = 1
+	MissingDeviceToken     StatusCode = 2
+	MissingTopic           StatusCode = 3
+	MissingPayload         StatusCode = 4
+	InvalidTokenSize       StatusCode = 5
+	InvalidTopicSize       StatusCode = 6
+	InvalidPayloadSize     StatusCode = 7
+	InvalidToken           StatusCode = 8
+	Shutdown               StatusCode = 10
+	UnknownError           StatusCode = 255
 )
 
 // The APNS payload. Token should be a valid 32 byte device token. Payload is a json encoded
@@ -49,20 +62,6 @@ type Feedback struct {
 }
 
 type StatusCode uint8
-
-const (
-	NoError            StatusCode = 0
-	ProcessingError    StatusCode = 1
-	MissingDeviceToken StatusCode = 2
-	MissingTopic       StatusCode = 3
-	MissingPayload     StatusCode = 4
-	InvalidTokenSize   StatusCode = 5
-	InvalidTopicSize   StatusCode = 6
-	InvalidPayloadSize StatusCode = 7
-	InvalidToken       StatusCode = 8
-	Shutdown           StatusCode = 10
-	UnknownError       StatusCode = 255
-)
 
 // Apple defined error codes
 var ErrorMessages = map[StatusCode]string{
@@ -123,7 +122,7 @@ func frame(payload *Payload) []byte {
 // is received, the connection will automatically reconnect and attempt to resend
 // recent payloads as needed.
 type Connection struct {
-	config          *tls.Config
+	cert            tls.Certificate
 	pushAddress     string
 	feedbackAddress string
 	conn            *tls.Conn
@@ -165,7 +164,7 @@ func NewConnection(cert tls.Certificate, sandbox bool, bufferSize uint32) *Conne
 	return &Connection{
 		pushAddress:     pushAddress,
 		feedbackAddress: feedbackAddress,
-		config:          &tls.Config{Certificates: []tls.Certificate{cert}},
+		cert:            cert,
 		push:            make(chan *Payload),
 		error:           make(chan error),
 		badToken:        make(chan []byte),
@@ -307,7 +306,7 @@ func (c *Connection) connect() (err error) {
 	if c.conn != nil {
 		c.conn.Close()
 	}
-	conn, err := net.Dial("tcp", c.pushAddress)
+	conn, err := net.Dial("tcp", fmt.Sprintf("%s:%d", c.pushAddress, GatewayPort))
 	if err != nil {
 		return
 	}
@@ -319,7 +318,8 @@ func (c *Connection) connect() (err error) {
 			return
 		}
 	}
-	c.conn = tls.Client(conn, c.config)
+	config := &tls.Config{Certificates: []tls.Certificate{c.cert}, ServerName: c.pushAddress}
+	c.conn = tls.Client(conn, config)
 	err = c.conn.Handshake()
 	return
 }
@@ -385,10 +385,11 @@ func (c *Connection) CheckFeedback() (feedback []*Feedback, err error) {
 	feedback = make([]*Feedback, 0, 100)
 	var conn net.Conn
 	var read int
-	if conn, err = net.Dial("tcp", c.feedbackAddress); err != nil {
+	if conn, err = net.Dial("tcp", fmt.Sprintf("%s:%d", c.feedbackAddress, FeedbackPort)); err != nil {
 		return
 	}
-	feedbackConn := tls.Client(conn, c.config)
+	config := &tls.Config{Certificates: []tls.Certificate{c.cert}, ServerName: c.feedbackAddress}
+	feedbackConn := tls.Client(conn, config)
 	defer feedbackConn.Close()
 	if err = c.conn.Handshake(); err != nil {
 		return
