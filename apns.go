@@ -6,11 +6,13 @@ package goapenuts
 import (
 	"bytes"
 	"crypto/tls"
+	"crypto/x509"
 	"encoding/binary"
-	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net"
+	"strconv"
 	"time"
 )
 
@@ -32,6 +34,10 @@ const (
 	InvalidToken           StatusCode = 8
 	Shutdown               StatusCode = 10
 	UnknownError           StatusCode = 255
+	// frameOverhead is the constant size of all non-payload frame components
+	frameOverhead = 3 + 32 + 3 + 3 + 4 + 3 + 4 + 3 + 1
+	// packageOverhead is the size of the package header
+	packageOverhead = 5
 )
 
 // The APNS payload. Token should be a valid 32 byte device token. Payload is a json encoded
@@ -85,34 +91,34 @@ var resendStatusCodes = map[StatusCode]bool{
 }
 
 func frame(payload *Payload) []byte {
-	frameBuffer := bytes.NewBuffer([]byte{})
-	// command
-	frameBuffer.WriteByte(1)
-	binary.Write(frameBuffer, binary.BigEndian, uint16(len(payload.Token)))
-	frameBuffer.Write(payload.Token)
+	frameLength := frameOverhead + len(payload.Payload)
+	packageBuffer := bytes.NewBuffer(make([]byte, 0, packageOverhead+frameLength))
 
-	frameBuffer.WriteByte(2)
-	binary.Write(frameBuffer, binary.BigEndian, uint16(len(payload.Payload)))
-	frameBuffer.Write(payload.Payload)
-
-	frameBuffer.WriteByte(3)
-	binary.Write(frameBuffer, binary.BigEndian, uint16(4))
-	binary.Write(frameBuffer, binary.BigEndian, payload.id)
-
-	frameBuffer.WriteByte(4)
-	binary.Write(frameBuffer, binary.BigEndian, uint16(4))
-	binary.Write(frameBuffer, binary.BigEndian, payload.Expiration)
-
-	frameBuffer.WriteByte(5)
-	binary.Write(frameBuffer, binary.BigEndian, uint8(1))
-	frameBuffer.WriteByte(payload.Priority)
-
-	frameData := frameBuffer.Bytes()
-
-	packageBuffer := bytes.NewBuffer([]byte{})
+	// enhanced notification frame
 	packageBuffer.WriteByte(2)
-	binary.Write(packageBuffer, binary.BigEndian, uint32(len(frameData)))
-	packageBuffer.Write(frameData)
+	binary.Write(packageBuffer, binary.BigEndian, uint32(frameLength))
+
+	// token
+	packageBuffer.WriteByte(1)
+	binary.Write(packageBuffer, binary.BigEndian, uint16(len(payload.Token)))
+	packageBuffer.Write(payload.Token)
+	// payload
+	packageBuffer.WriteByte(2)
+	binary.Write(packageBuffer, binary.BigEndian, uint16(len(payload.Payload)))
+	packageBuffer.Write(payload.Payload)
+	// payload id
+	packageBuffer.WriteByte(3)
+	binary.Write(packageBuffer, binary.BigEndian, uint16(4))
+	binary.Write(packageBuffer, binary.BigEndian, payload.id)
+	// expiration
+	packageBuffer.WriteByte(4)
+	binary.Write(packageBuffer, binary.BigEndian, uint16(4))
+	binary.Write(packageBuffer, binary.BigEndian, payload.Expiration)
+	// priority
+	packageBuffer.WriteByte(5)
+	binary.Write(packageBuffer, binary.BigEndian, uint16(1))
+	packageBuffer.WriteByte(payload.Priority)
+
 	return packageBuffer.Bytes()
 }
 
@@ -128,11 +134,13 @@ type Connection struct {
 	conn            *tls.Conn
 	push            chan *Payload
 	stop            chan bool
-	error           chan error
 	badToken        chan []byte
 	payloadBuffer   []*Payload
 	lastPayloadId   uint32
 	keepAlivePeriod time.Duration
+	noDelay         bool
+	sandbox         bool
+	rootCAs         *x509.CertPool
 }
 
 // A convenience method to create a new Payload that expires immediately and has
@@ -166,9 +174,10 @@ func NewConnection(cert tls.Certificate, sandbox bool, bufferSize uint32) *Conne
 		feedbackAddress: feedbackAddress,
 		cert:            cert,
 		push:            make(chan *Payload),
-		error:           make(chan error),
 		badToken:        make(chan []byte),
 		payloadBuffer:   make([]*Payload, bufferSize),
+		sandbox:         sandbox,
+		noDelay:         true,
 	}
 }
 
@@ -176,6 +185,34 @@ func NewConnection(cert tls.Certificate, sandbox bool, bufferSize uint32) *Conne
 // Must be called before Connect().
 func (c *Connection) SetKeepAlivePeriod(keepAlivePeriod time.Duration) {
 	c.keepAlivePeriod = keepAlivePeriod
+}
+
+// Sandbox returns true if this connection is in sandbox mode.
+func (c *Connection) Sandbox() bool {
+	return c.sandbox
+}
+
+// PushAddress returns the address of the configured push gateway.
+func (c *Connection) PushAddress() string {
+	return c.pushAddress
+}
+
+// FeedbackAddress returns the address of the configured feedback server.
+func (c *Connection) FeedbackAddress() string {
+	return c.feedbackAddress
+}
+
+// SetRootCAs sets the root certificate authorities that the client will use
+// when connecting to the APNs. Pass nil (default) to use the host's root CA
+// set. Must be called before Connect().
+func (c *Connection) SetRootCAs(rootCAs *x509.CertPool) {
+	c.rootCAs = rootCAs
+}
+
+// SetNoDelay is passed to the underlying TCP socket. Must be called before
+// Connect. Default is true. See https://golang.org/pkg/net/#TCPConn.SetNoDelay
+func (c *Connection) SetNoDelay(noDelay bool) {
+	c.noDelay = noDelay
 }
 
 func (c *Connection) nextPayloadId(i uint32) (n uint32) {
@@ -213,17 +250,6 @@ func (c *Connection) copyPayloadBuffer(startId uint32, includeStart bool) (buffe
 	return
 }
 
-func (c *Connection) sendError(err error) {
-	if err == nil {
-		return
-	}
-	select {
-	case c.error <- err:
-	default:
-		// Errors are not being tracked, move on
-	}
-}
-
 func (c *Connection) sendBadToken(token []byte) {
 	select {
 	case c.badToken <- token:
@@ -234,8 +260,8 @@ func (c *Connection) sendBadToken(token []byte) {
 
 func (c *Connection) reconnect() (err error) {
 	err = c.connect()
-	c.sendError(err)
 	if err != nil {
+		log.Println("Connection error:", err)
 		c.Close()
 		return
 	}
@@ -243,9 +269,33 @@ func (c *Connection) reconnect() (err error) {
 	return
 }
 
+type apnsErrorResponse struct {
+	hasResponse bool
+	command     uint8
+	status      StatusCode
+	id          uint32
+	error       error
+}
+
+func (c *Connection) readError(errorChannel chan apnsErrorResponse) {
+	data := [6]byte{}
+	response := apnsErrorResponse{}
+	_, response.error = c.conn.Read(data[:])
+	if response.error == nil {
+		response.hasResponse = true
+		buf := bytes.NewBuffer(data[:])
+		binary.Read(buf, binary.BigEndian, &response.command)
+		binary.Read(buf, binary.BigEndian, &response.status)
+		binary.Read(buf, binary.BigEndian, &response.id)
+		log.Printf("APNS Error %d: %s", response.status, ErrorMessages[response.status])
+	}
+	errorChannel <- response
+}
+
 func (c *Connection) runPush() {
 	defer c.conn.Close()
-	response := [6]byte{}
+	errorChannel := make(chan apnsErrorResponse)
+	go c.readError(errorChannel)
 	for {
 		select {
 		case <-c.stop:
@@ -255,25 +305,16 @@ func (c *Connection) runPush() {
 			c.payloadBuffer[payload.id] = payload
 			c.lastPayloadId = payload.id
 			if _, err := c.conn.Write(frame(payload)); err != nil {
-				c.sendError(err)
+				log.Println("Error sending notification payload:", err)
 				c.reconnect()
 				return
 			}
-		default:
-			c.conn.SetReadDeadline(time.Now().Add(250 * time.Millisecond))
-			n, err := c.conn.Read(response[:])
-			if n > 0 {
-				var command uint8
-				var status StatusCode
-				var id uint32
-				data := bytes.NewBuffer(response[:])
-				binary.Read(data, binary.BigEndian, &command)
-				binary.Read(data, binary.BigEndian, &status)
-				binary.Read(data, binary.BigEndian, &id)
-				c.sendError(errors.New(fmt.Sprintf("APNS Error %d: %s", status, ErrorMessages[status])))
+		case errorResponse := <-errorChannel:
+			if errorResponse.hasResponse {
+				log.Printf("APNS Error processing %d: %s", errorResponse.status, ErrorMessages[errorResponse.status])
 				// Resend all payloads since the last successful push
-				resendBuffer, rejectedPayload := c.copyPayloadBuffer(id, resendStatusCodes[status])
-				if status == InvalidToken {
+				resendBuffer, rejectedPayload := c.copyPayloadBuffer(errorResponse.id, resendStatusCodes[errorResponse.status])
+				if errorResponse.status == InvalidToken {
 					c.sendBadToken(rejectedPayload.Token)
 				}
 				c.reconnect()
@@ -286,15 +327,8 @@ func (c *Connection) runPush() {
 				}
 				return
 			}
-			if err != nil {
-				switch err.(type) {
-				case net.Error:
-					if err.(net.Error).Timeout() {
-						continue
-					}
-				default:
-				}
-				c.sendError(err)
+			if errorResponse.error != nil {
+				log.Println("Error reading from APNS:", errorResponse.error)
 				c.reconnect()
 				return
 			}
@@ -306,7 +340,9 @@ func (c *Connection) connect() (err error) {
 	if c.conn != nil {
 		c.conn.Close()
 	}
-	conn, err := net.Dial("tcp", fmt.Sprintf("%s:%d", c.pushAddress, GatewayPort))
+	apnsURL := net.JoinHostPort(c.pushAddress, strconv.Itoa(GatewayPort))
+	log.Println("Connecting to APNS.", apnsURL)
+	conn, err := net.Dial("tcp", apnsURL)
 	if err != nil {
 		return
 	}
@@ -317,8 +353,11 @@ func (c *Connection) connect() (err error) {
 		if err = conn.(*net.TCPConn).SetKeepAlivePeriod(c.keepAlivePeriod); err != nil {
 			return
 		}
+		if err = conn.(*net.TCPConn).SetNoDelay(c.noDelay); err != nil {
+			return
+		}
 	}
-	config := &tls.Config{Certificates: []tls.Certificate{c.cert}, ServerName: c.pushAddress}
+	config := &tls.Config{Certificates: []tls.Certificate{c.cert}, ServerName: c.pushAddress, RootCAs: c.rootCAs}
 	c.conn = tls.Client(conn, config)
 	err = c.conn.Handshake()
 	return
@@ -358,15 +397,6 @@ func (c *Connection) Connected() bool {
 	return c.conn != nil
 }
 
-// Returns a channel that can be used to monitor errors from the APNS.
-// Useful for logging purposes, no action should be necessary.
-//
-// Note: an unbuffered channel is used, so if you intend to track errors
-// you should start listening before calling c.Connect()
-func (c *Connection) Error() <-chan error {
-	return c.error
-}
-
 // Returns a channel that can be used to monitor bad token responses from the APNS.
 // Tokens sent to this channel should not be used again. Under normal operation
 // invalid tokens will be returned by the CheckFeedback(), if tokens are sent
@@ -388,7 +418,7 @@ func (c *Connection) CheckFeedback() (feedback []*Feedback, err error) {
 	if conn, err = net.Dial("tcp", fmt.Sprintf("%s:%d", c.feedbackAddress, FeedbackPort)); err != nil {
 		return
 	}
-	config := &tls.Config{Certificates: []tls.Certificate{c.cert}, ServerName: c.feedbackAddress}
+	config := &tls.Config{Certificates: []tls.Certificate{c.cert}, ServerName: c.feedbackAddress, RootCAs: c.rootCAs}
 	feedbackConn := tls.Client(conn, config)
 	defer feedbackConn.Close()
 	if err = c.conn.Handshake(); err != nil {
@@ -396,7 +426,7 @@ func (c *Connection) CheckFeedback() (feedback []*Feedback, err error) {
 	}
 	response := [38]byte{}
 	for {
-		feedbackConn.SetReadDeadline(time.Now().Add(5 * time.Second))
+		feedbackConn.SetReadDeadline(time.Now().Add(30 * time.Second))
 		if read, err = feedbackConn.Read(response[:]); err != nil {
 			switch err.(type) {
 			case net.Error:
